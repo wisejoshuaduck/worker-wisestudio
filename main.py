@@ -59,19 +59,28 @@ def check_key(x_worker_key: str | None) -> None:
 
 
 def get_base_ytdlp_opts() -> dict:
-    """Génère les options de base yt-dlp avec proxy, geo_bypass et cookies."""
+    """Génère les options de base yt-dlp avec proxy, geo_bypass, client mobile et User-Agent custom."""
     opts = {
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
+        # Forcer yt-dlp à utiliser les clients iOS/Android/Mobile Web (beaucoup moins restrictifs)
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "mweb", "android"],
+                "player_skip": ["webpage", "configs"]
+            }
+        },
+        # Forcer un User-Agent d'un iPhone récent
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+        }
     }
     
-    # Utilisation d'un proxy si défini dans l'environnement
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
         
-    # Utilisation d'un fichier cookies.txt s'il existe à la racine du projet
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
 
