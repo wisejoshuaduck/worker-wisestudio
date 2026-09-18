@@ -3,25 +3,19 @@ Worker WiseStudio — FastAPI + yt-dlp.
 
 Deux usages, un seul endpoint /tasks/youtube avec un champ "mode" :
   - mode="audio"  : extrait l'audio (pour la pipeline shorts/podcast de
-    WiseStudio), le découpe en tronçons de 10 minutes (même convention que
-    le chunking déjà en place côté navigateur dans pipeline.js /
-    social-format.js, pour rester sous la limite de 24 Mo par requête
-    Whisper/Groq), et envoie tous les tronçons en un seul callback
-    multipart vers WiseStudio.
+    WiseStudio), le découpe en tronçons de 10 minutes, et envoie tous 
+    les tronçons en un seul callback multipart vers WiseStudio.
   - mode="mp4"    : télécharge la vidéo complète (vidéo+audio fusionnés en
-    MP4), fonctionnalité de téléchargement direct indépendante de la
-    génération de shorts, et l'envoie en callback à WiseStudio.
+    MP4) et l'envoie en callback à WiseStudio.
 
-Sécurité :
-  - clé partagée comparée en temps constant (hmac.compare_digest), jamais
-    par égalité simple, pour éviter le timing attack.
-  - la durée de la vidéo est vérifiée AVANT tout téléchargement (appel
-    yt-dlp en mode "métadonnées seules") : au-delà de MAX_DURATION_SECONDS,
-    la requête est refusée immédiatement (HTTP 422), sans jamais lancer de
-    téléchargement ni de tâche de fond — WiseStudio n'a donc jamais à
-    débiter de Notes ni créer de projet pour une vidéo hors limite.
+Sécurité & Robustesse :
+  - Clé partagée comparée en temps constant (hmac.compare_digest).
+  - Vérification asynchrone de la durée avant téléchargement.
+  - Endpoint /ping pour empêcher la mise en veille de Render.
+  - Streaming d'upload pour éviter le dépassement de mémoire RAM.
 """
 
+import asyncio
 import hmac
 import os
 import shutil
@@ -36,10 +30,10 @@ from pydantic import BaseModel
 
 API_SECRET = os.getenv("WORKER_SECRET_KEY", "")
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))  # 1h
-CHUNK_SECONDS = 600  # 10 min — même convention que le chunking navigateur
+CHUNK_SECONDS = 600  # 10 min
 
 # Variables pour le contournement des blocages de géolocalisation / datacenter
-PROXY_URL = os.getenv("PROXY_URL", "")  # ex: http://user:pass@proxy.com:8080 ou socks5://...
+PROXY_URL = os.getenv("PROXY_URL", "")
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 COOKIES_FILE_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
@@ -50,7 +44,7 @@ class YoutubeTaskRequest(BaseModel):
     youtube_url: str
     project_id: int
     callback_url: str
-    mode: str = "audio"  # "audio" (pipeline shorts/podcast) ou "mp4" (téléchargement direct)
+    mode: str = "audio"  # "audio" ou "mp4"
 
 
 def check_key(x_worker_key: str | None) -> None:
@@ -63,16 +57,15 @@ def get_base_ytdlp_opts() -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "nocache-dir": True,
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
-        # Forcer yt-dlp à utiliser les clients iOS/Android/Mobile Web (beaucoup moins restrictifs)
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "mweb", "android"],
                 "player_skip": ["webpage", "configs"]
             }
         },
-        # Forcer un User-Agent d'un iPhone récent
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
         }
@@ -88,7 +81,7 @@ def get_base_ytdlp_opts() -> dict:
 
 
 def probe_duration(youtube_url: str) -> tuple[float, str]:
-    """Récupère durée + titre SANS télécharger (appel léger, synchrone)."""
+    """Récupère durée + titre SANS télécharger (appel synchrone exécuté dans un thread séparé)."""
     opts = get_base_ytdlp_opts()
     opts["skip_download"] = True
 
@@ -99,14 +92,22 @@ def probe_duration(youtube_url: str) -> tuple[float, str]:
 
 def notify_error(callback_url: str, project_id: int, message: str) -> None:
     try:
-        with httpx.Client(timeout=30.0) as client:
+        timeout = httpx.Timeout(10.0, read=30.0)
+        with httpx.Client(timeout=timeout) as client:
             client.post(
                 callback_url,
                 json={"project_id": project_id, "error": message},
                 headers={"X-Worker-Key": API_SECRET},
             )
     except Exception:
-        pass  # Le callback est notre seul canal d'erreur
+        pass
+
+
+def stream_file(file_path: str, chunk_size: int = 65536):
+    """Générateur pour streaming d'upload de fichiers volumineux sans surcharger la mémoire RAM."""
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            yield chunk
 
 
 def process_audio(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
@@ -161,8 +162,11 @@ def process_audio(youtube_url: str, project_id: int, callback_url: str, duration
             "chunk_starts": ",".join(str(s) for s in chunk_starts[: len(chunk_paths)]),
         }
         headers = {"X-Worker-Key": API_SECRET}
-        with httpx.Client(timeout=180.0) as client:
+        timeout = httpx.Timeout(10.0, read=300.0, write=300.0)
+        
+        with httpx.Client(timeout=timeout) as client:
             client.post(callback_url, data=data, files=files, headers=headers)
+            
         for _, (_, fh, _) in files:
             fh.close()
 
@@ -177,7 +181,7 @@ def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: 
     try:
         ydl_opts = get_base_ytdlp_opts()
         ydl_opts.update({
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "format": "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a]/best[ext=mp4]/best",
             "outtmpl": os.path.join(temp_dir, "video.%(ext)s"),
             "merge_output_format": "mp4",
         })
@@ -192,17 +196,19 @@ def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: 
                 raise RuntimeError("Téléchargement MP4 échoué (fichier introuvable).")
             video_path = os.path.join(temp_dir, candidates[0])
 
-        with open(video_path, "rb") as f:
-            files = {"video": ("video.mp4", f, "video/mp4")}
-            data = {
-                "project_id": project_id,
-                "duration_seconds": duration,
-                "title": title,
-                "mode": "mp4",
-            }
-            headers = {"X-Worker-Key": API_SECRET}
-            with httpx.Client(timeout=300.0) as client:
-                client.post(callback_url, data=data, files=files, headers=headers)
+        data = {
+            "project_id": project_id,
+            "duration_seconds": duration,
+            "title": title,
+            "mode": "mp4",
+        }
+        headers = {"X-Worker-Key": API_SECRET}
+        timeout = httpx.Timeout(10.0, read=600.0, write=600.0)
+
+        # Envoi en mode streaming pour ne pas charger tout le MP4 en mémoire RAM
+        with httpx.Client(timeout=timeout) as client:
+            files = {"video": ("video.mp4", stream_file(video_path), "video/mp4")}
+            client.post(callback_url, data=data, files=files, headers=headers)
 
     except Exception as e:
         notify_error(callback_url, project_id, str(e))
@@ -222,7 +228,8 @@ async def handle_youtube(
         raise HTTPException(status_code=400, detail="mode invalide (attendu: audio | mp4)")
 
     try:
-        duration, title = probe_duration(task.youtube_url)
+        # Exécution dans un thread séparé pour ne pas bloquer l'Event Loop de FastAPI
+        duration, title = await asyncio.to_thread(probe_duration, task.youtube_url)
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Impossible de lire les métadonnées : {e}")
 
@@ -240,6 +247,8 @@ async def handle_youtube(
     return {"status": "queued", "project_id": task.project_id, "duration_seconds": duration, "title": title}
 
 
+@app.get("/ping")
 @app.get("/health")
-async def health():
-    return {"ok": True}
+async def ping():
+    """Endpoint ultra-léger pour les vérifications de disponibilité et l'anti-mise en veille."""
+    return {"status": "alive", "ok": True}
