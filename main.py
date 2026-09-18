@@ -20,18 +20,13 @@ Sécurité :
     la requête est refusée immédiatement (HTTP 422), sans jamais lancer de
     téléchargement ni de tâche de fond — WiseStudio n'a donc jamais à
     débiter de Notes ni créer de projet pour une vidéo hors limite.
-
-⚠️ AVERTISSEMENT : l'extraction de contenu YouTube via yt-dlp n'est PAS
-conforme aux conditions d'utilisation de YouTube. yt-dlp doit être mis à
-jour régulièrement pour suivre les contre-mesures anti-scraping de YouTube,
-et les IP des hébergeurs datacenter (Render, GCP...) sont parfois bloquées.
-Voir README.md.
 """
 
 import hmac
 import os
 import shutil
 import tempfile
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -42,6 +37,11 @@ from pydantic import BaseModel
 API_SECRET = os.getenv("WORKER_SECRET_KEY", "")
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))  # 1h
 CHUNK_SECONDS = 600  # 10 min — même convention que le chunking navigateur
+
+# Variables pour le contournement des blocages de géolocalisation / datacenter
+PROXY_URL = os.getenv("PROXY_URL", "")  # ex: http://user:pass@proxy.com:8080 ou socks5://...
+GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
+COOKIES_FILE_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
 app = FastAPI(title="WiseStudio Video Worker")
 
@@ -58,9 +58,31 @@ def check_key(x_worker_key: str | None) -> None:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
 
 
+def get_base_ytdlp_opts() -> dict:
+    """Génère les options de base yt-dlp avec proxy, geo_bypass et cookies."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "geo_bypass_country": GEO_BYPASS_COUNTRY,
+    }
+    
+    # Utilisation d'un proxy si défini dans l'environnement
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+        
+    # Utilisation d'un fichier cookies.txt s'il existe à la racine du projet
+    if os.path.isfile(COOKIES_FILE_PATH):
+        opts["cookiefile"] = COOKIES_FILE_PATH
+
+    return opts
+
+
 def probe_duration(youtube_url: str) -> tuple[float, str]:
     """Récupère durée + titre SANS télécharger (appel léger, synchrone)."""
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = get_base_ytdlp_opts()
+    opts["skip_download"] = True
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
         return float(info.get("duration") or 0), str(info.get("title") or "Vidéo YouTube")
@@ -75,13 +97,14 @@ def notify_error(callback_url: str, project_id: int, message: str) -> None:
                 headers={"X-Worker-Key": API_SECRET},
             )
     except Exception:
-        pass  # le callback est déjà notre seul canal d'erreur ; rien à faire de plus ici
+        pass  # Le callback est notre seul canal d'erreur
 
 
 def process_audio(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
     temp_dir = tempfile.mkdtemp()
     try:
-        ydl_opts = {
+        ydl_opts = get_base_ytdlp_opts()
+        ydl_opts.update({
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "source.%(ext)s"),
             "postprocessors": [{
@@ -89,9 +112,8 @@ def process_audio(youtube_url: str, project_id: int, callback_url: str, duration
                 "preferredcodec": "mp3",
                 "preferredquality": "128",
             }],
-            "quiet": True,
-            "no_warnings": True,
-        }
+        })
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(youtube_url, download=True)
 
@@ -99,15 +121,11 @@ def process_audio(youtube_url: str, project_id: int, callback_url: str, duration
         if not os.path.isfile(source_audio):
             raise RuntimeError("Extraction audio échouée (fichier source introuvable).")
 
-        # Découpage en tronçons de 10 min (ffmpeg natif, sans ré-encodage
-        # coûteux : -c copy) pour rester sous la limite Whisper/Groq de
-        # 24 Mo par requête, exactement comme le fait déjà le navigateur
-        # pour les uploads directs (voir assets/js/pipeline.js côté PHP).
+        # Découpage en tronçons de 10 min
         chunk_starts = list(range(0, max(int(duration), 1), CHUNK_SECONDS)) or [0]
         chunk_paths: list[Path] = []
         for i, start in enumerate(chunk_starts):
             chunk_path = Path(temp_dir) / f"chunk_{i}.mp3"
-            import subprocess
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-i", source_audio,
@@ -148,20 +166,18 @@ def process_audio(youtube_url: str, project_id: int, callback_url: str, duration
 def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
     temp_dir = tempfile.mkdtemp()
     try:
-        ydl_opts = {
+        ydl_opts = get_base_ytdlp_opts()
+        ydl_opts.update({
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": os.path.join(temp_dir, "video.%(ext)s"),
             "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-        }
+        })
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(youtube_url, download=True)
 
         video_path = os.path.join(temp_dir, "video.mp4")
         if not os.path.isfile(video_path):
-            # merge_output_format peut échouer selon les formats disponibles ;
-            # on retente la première correspondance .mp4 trouvée dans temp_dir.
             candidates = [f for f in os.listdir(temp_dir) if f.endswith(".mp4")]
             if not candidates:
                 raise RuntimeError("Téléchargement MP4 échoué (fichier introuvable).")
@@ -196,9 +212,6 @@ async def handle_youtube(
     if task.mode not in ("audio", "mp4"):
         raise HTTPException(status_code=400, detail="mode invalide (attendu: audio | mp4)")
 
-    # Vérification de durée SYNCHRONE, avant toute mise en file d'attente :
-    # WiseStudio ne doit jamais créer de projet ni débiter de Notes pour
-    # une vidéo hors limite.
     try:
         duration, title = probe_duration(task.youtube_url)
     except Exception as e:
