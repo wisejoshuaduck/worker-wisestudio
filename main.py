@@ -1,20 +1,17 @@
 """
 Worker WiseStudio — FastAPI + yt-dlp.
-
 Deux usages, un seul endpoint /tasks/youtube avec un champ "mode" :
   - mode="audio"  : extrait l'audio (pour la pipeline shorts/podcast de
-    WiseStudio), le découpe en tronçons de 10 minutes, et envoie tous 
+    WiseStudio), le découpe en tronçons de 10 minutes, et envoie tous
     les tronçons en un seul callback multipart vers WiseStudio.
   - mode="mp4"    : télécharge la vidéo complète (vidéo+audio fusionnés en
     MP4) et l'envoie en callback à WiseStudio.
-
 Sécurité & Robustesse :
   - Clé partagée comparée en temps constant (hmac.compare_digest).
   - Vérification asynchrone de la durée avant téléchargement.
   - Endpoint /ping pour empêcher la mise en veille de Render.
   - Streaming d'upload pour éviter le dépassement de mémoire RAM.
 """
-
 import asyncio
 import hmac
 import os
@@ -22,6 +19,7 @@ import shutil
 import tempfile
 import subprocess
 from pathlib import Path
+from typing import Generator
 
 import httpx
 import yt_dlp
@@ -53,27 +51,46 @@ def check_key(x_worker_key: str | None) -> None:
 
 
 def get_base_ytdlp_opts() -> dict:
-    """Génère les options de base yt-dlp avec proxy, geo_bypass, client mobile et User-Agent custom."""
+    """Options yt-dlp robustes pour YouTube fin 2026 (clients + anti-blocage)."""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "nocache-dir": True,
+        "no_cache_dir": True,          # ← corrigé (anciennement "nocache-dir")
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 5,
+        "retry_sleep_functions": {"http": lambda n: min(4 ** n, 30)},
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "mweb", "android"],
-                "player_skip": ["webpage", "configs"]
+                # Clients les plus fiables actuellement (ordre important)
+                "player_client": [
+                    "android_vr",
+                    "ios",
+                    "mweb",
+                    "tv",
+                    "web_embedded",
+                    "android",
+                ],
+                "player_skip": ["webpage", "configs"],
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-        }
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        # Utile sur les IPs datacenter
+        "socket_timeout": 30,
     }
-    
+
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
-        
+
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
 
@@ -81,10 +98,9 @@ def get_base_ytdlp_opts() -> dict:
 
 
 def probe_duration(youtube_url: str) -> tuple[float, str]:
-    """Récupère durée + titre SANS télécharger (appel synchrone exécuté dans un thread séparé)."""
+    """Récupère durée + titre SANS télécharger."""
     opts = get_base_ytdlp_opts()
     opts["skip_download"] = True
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
         return float(info.get("duration") or 0), str(info.get("title") or "Vidéo YouTube")
@@ -103,8 +119,8 @@ def notify_error(callback_url: str, project_id: int, message: str) -> None:
         pass
 
 
-def stream_file(file_path: str, chunk_size: int = 65536):
-    """Générateur pour streaming d'upload de fichiers volumineux sans surcharger la mémoire RAM."""
+def stream_file(file_path: str, chunk_size: int = 65536) -> Generator[bytes, None, None]:
+    """Générateur pour streaming d'upload sans charger tout en RAM."""
     with open(file_path, "rb") as f:
         while chunk := f.read(chunk_size):
             yield chunk
@@ -112,6 +128,7 @@ def stream_file(file_path: str, chunk_size: int = 65536):
 
 def process_audio(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
     temp_dir = tempfile.mkdtemp()
+    open_files = []
     try:
         ydl_opts = get_base_ytdlp_opts()
         ydl_opts.update({
@@ -127,52 +144,82 @@ def process_audio(youtube_url: str, project_id: int, callback_url: str, duration
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(youtube_url, download=True)
 
-        source_audio = os.path.join(temp_dir, "source.mp3")
-        if not os.path.isfile(source_audio):
+        # Cherche le fichier source (parfois l'extension varie)
+        source_audio = None
+        for name in ("source.mp3", "source.m4a", "source.webm", "source.opus"):
+            candidate = os.path.join(temp_dir, name)
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                source_audio = candidate
+                break
+
+        if not source_audio:
+            # Dernier recours : n'importe quel fichier audio
+            for f in os.listdir(temp_dir):
+                if f.startswith("source.") and os.path.getsize(os.path.join(temp_dir, f)) > 0:
+                    source_audio = os.path.join(temp_dir, f)
+                    break
+
+        if not source_audio:
             raise RuntimeError("Extraction audio échouée (fichier source introuvable).")
 
         # Découpage en tronçons de 10 min
         chunk_starts = list(range(0, max(int(duration), 1), CHUNK_SECONDS)) or [0]
         chunk_paths: list[Path] = []
+
         for i, start in enumerate(chunk_starts):
             chunk_path = Path(temp_dir) / f"chunk_{i}.mp3"
-            subprocess.run(
-                [
+            cmd = [
+                "ffmpeg", "-y", "-i", source_audio,
+                "-ss", str(start), "-t", str(CHUNK_SECONDS),
+                "-c", "copy", str(chunk_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                # Si -c copy échoue (codecs incompatibles), on réencode
+                cmd = [
                     "ffmpeg", "-y", "-i", source_audio,
                     "-ss", str(start), "-t", str(CHUNK_SECONDS),
-                    "-c", "copy", str(chunk_path),
-                ],
-                check=True, capture_output=True,
-            )
+                    "-c:a", "libmp3lame", "-b:a", "128k",
+                    str(chunk_path),
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg chunk {i} failed: {result.stderr[-500:]}")
+
             if chunk_path.is_file() and chunk_path.stat().st_size > 0:
                 chunk_paths.append(chunk_path)
 
         if not chunk_paths:
             raise RuntimeError("Découpage audio échoué : aucun tronçon produit.")
 
-        files = [
-            ("chunks", (f"chunk_{i}.mp3", open(p, "rb"), "audio/mpeg"))
-            for i, p in enumerate(chunk_paths)
-        ]
+        files = []
+        for i, p in enumerate(chunk_paths):
+            fh = open(p, "rb")
+            open_files.append(fh)
+            files.append(("chunks", (f"chunk_{i}.mp3", fh, "audio/mpeg")))
+
         data = {
             "project_id": project_id,
             "duration_seconds": duration,
             "title": title,
             "mode": "audio",
-            "chunk_starts": ",".join(str(s) for s in chunk_starts[: len(chunk_paths)]),
+            "chunk_starts": ",".join(str(s) for s in chunk_starts[:len(chunk_paths)]),
         }
         headers = {"X-Worker-Key": API_SECRET}
         timeout = httpx.Timeout(10.0, read=300.0, write=300.0)
-        
+
         with httpx.Client(timeout=timeout) as client:
-            client.post(callback_url, data=data, files=files, headers=headers)
-            
-        for _, (_, fh, _) in files:
-            fh.close()
+            resp = client.post(callback_url, data=data, files=files, headers=headers)
+            resp.raise_for_status()
 
     except Exception as e:
-        notify_error(callback_url, project_id, str(e))
+        notify_error(callback_url, project_id, f"Audio processing failed: {str(e)}")
     finally:
+        for fh in open_files:
+            try:
+                fh.close()
+            except Exception:
+                pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -181,7 +228,12 @@ def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: 
     try:
         ydl_opts = get_base_ytdlp_opts()
         ydl_opts.update({
-            "format": "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a]/best[ext=mp4]/best",
+            # Préfère H.264 + AAC (meilleure compatibilité)
+            "format": (
+                "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a]/"
+                "bestvideo[ext=mp4]+bestaudio/"
+                "best[ext=mp4]/best"
+            ),
             "outtmpl": os.path.join(temp_dir, "video.%(ext)s"),
             "merge_output_format": "mp4",
         })
@@ -190,8 +242,11 @@ def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: 
             ydl.extract_info(youtube_url, download=True)
 
         video_path = os.path.join(temp_dir, "video.mp4")
-        if not os.path.isfile(video_path):
-            candidates = [f for f in os.listdir(temp_dir) if f.endswith(".mp4")]
+        if not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
+            candidates = [
+                f for f in os.listdir(temp_dir)
+                if f.endswith((".mp4", ".mkv", ".webm")) and os.path.getsize(os.path.join(temp_dir, f)) > 0
+            ]
             if not candidates:
                 raise RuntimeError("Téléchargement MP4 échoué (fichier introuvable).")
             video_path = os.path.join(temp_dir, candidates[0])
@@ -205,13 +260,13 @@ def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: 
         headers = {"X-Worker-Key": API_SECRET}
         timeout = httpx.Timeout(10.0, read=600.0, write=600.0)
 
-        # Envoi en mode streaming pour ne pas charger tout le MP4 en mémoire RAM
         with httpx.Client(timeout=timeout) as client:
             files = {"video": ("video.mp4", stream_file(video_path), "video/mp4")}
-            client.post(callback_url, data=data, files=files, headers=headers)
+            resp = client.post(callback_url, data=data, files=files, headers=headers)
+            resp.raise_for_status()
 
     except Exception as e:
-        notify_error(callback_url, project_id, str(e))
+        notify_error(callback_url, project_id, f"MP4 processing failed: {str(e)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -228,13 +283,16 @@ async def handle_youtube(
         raise HTTPException(status_code=400, detail="mode invalide (attendu: audio | mp4)")
 
     try:
-        # Exécution dans un thread séparé pour ne pas bloquer l'Event Loop de FastAPI
         duration, title = await asyncio.to_thread(probe_duration, task.youtube_url)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Impossible de lire les métadonnées : {e}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Impossible de lire les métadonnées : {e}"
+        )
 
     if duration <= 0:
         raise HTTPException(status_code=422, detail="Durée de la vidéo introuvable.")
+
     if duration > MAX_DURATION_SECONDS:
         raise HTTPException(
             status_code=422,
@@ -242,9 +300,16 @@ async def handle_youtube(
         )
 
     target = process_audio if task.mode == "audio" else process_mp4
-    background_tasks.add_task(target, task.youtube_url, task.project_id, task.callback_url, duration, title)
+    background_tasks.add_task(
+        target, task.youtube_url, task.project_id, task.callback_url, duration, title
+    )
 
-    return {"status": "queued", "project_id": task.project_id, "duration_seconds": duration, "title": title}
+    return {
+        "status": "queued",
+        "project_id": task.project_id,
+        "duration_seconds": duration,
+        "title": title,
+    }
 
 
 @app.get("/ping")
