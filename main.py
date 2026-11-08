@@ -10,14 +10,13 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 COOKIES_FILE_PATH = "cookies.txt"
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 
-# Si vous préférez stocker les cookies dans une variable d'environnement sur Render
 COOKIES_CONTENT = os.getenv("COOKIES_CONTENT", "").strip()
 if COOKIES_CONTENT and not os.path.exists(COOKIES_FILE_PATH):
     with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as f:
@@ -32,6 +31,8 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
+        # Utilisation d'un format universel qui évite l'erreur "Requested format is not available"
+        "format": "best",
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "mweb"],
@@ -47,7 +48,6 @@ def get_base_ytdlp_opts() -> dict:
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
 
-    # Utilisation du fichier de cookies pour éviter le blocage "Sign in to confirm..."
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
 
@@ -56,7 +56,7 @@ def get_base_ytdlp_opts() -> dict:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "YouTube Extractor Service opérationnel avec cookies."}
+    return {"status": "online", "message": "YouTube Extractor Service opérationnel."}
 
 
 @app.post("/tasks/youtube")
@@ -84,7 +84,6 @@ async def create_youtube_task(request: Request):
         )
 
     opts = get_base_ytdlp_opts()
-    opts["format"] = "best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
