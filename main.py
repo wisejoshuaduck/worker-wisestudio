@@ -10,9 +10,10 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="1.7.0"
+    version="1.8.0"
 )
 
+# Vous pouvez vider DEFAULT_PROXY si vous souhaitez tester sans proxy : ""
 DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
 PROXY_URL = os.getenv("PROXY_URL", DEFAULT_PROXY).strip()
 COOKIES_FILE_PATH = os.getenv("COOKIES_FILE_PATH", "cookies.txt")
@@ -49,15 +50,6 @@ def get_base_ytdlp_opts() -> dict:
     return opts
 
 
-class VideoInfo(BaseModel):
-    id: str
-    title: str
-    duration: Optional[int]
-    thumbnail: Optional[str]
-    uploader: Optional[str]
-    url: Optional[str]
-
-
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "online", "message": "YouTube Extractor Service"}
@@ -65,13 +57,11 @@ def read_root():
 
 @app.post("/tasks/youtube")
 async def create_youtube_task(request: Request):
-    """Accepte indifféremment du JSON, des Form-data ou des Query params pour l'URL."""
     target_url = None
     
-    # 1. Essayer de récupérer depuis les paramètres d'URL (Query params)
+    # Récupération de l'URL peu importe la méthode d'envoi
     target_url = request.query_params.get("url") or request.query_params.get("youtube_url") or request.query_params.get("link")
     
-    # 2. Essayer de récupérer depuis le corps (JSON ou Form-data)
     if not target_url:
         try:
             content_type = request.headers.get("content-type", "")
@@ -108,30 +98,30 @@ async def create_youtube_task(request: Request):
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
         logger.error(f"Erreur d'extraction POST /tasks/youtube : {error_msg}")
-        if "407" in error_msg:
+        if "407" in error_msg or "Tunnel connection failed" in error_msg:
             raise HTTPException(
                 status_code=407, 
-                detail="Erreur Proxy (407). Vérifiez si l'IP Render est autorisée sur le panneau de votre fournisseur de proxy."
+                detail="Erreur Proxy (407). L'authentification a échoué ou l'adresse IP du serveur Render n'est pas autorisée par votre fournisseur de proxy."
             )
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
 
 
-@app.get("/info", response_model=VideoInfo)
+@app.get("/info")
 def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
     opts = get_base_ytdlp_opts()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            return VideoInfo(
-                id=info.get("id", ""),
-                title=info.get("title", ""),
-                duration=info.get("duration"),
-                thumbnail=info.get("thumbnail"),
-                uploader=info.get("uploader"),
-                url=info.get("url")
-            )
+            return {
+                "id": info.get("id", ""),
+                "title": info.get("title", ""),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "uploader": info.get("uploader"),
+                "url": info.get("url")
+            }
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        if "407" in error_msg:
-            raise HTTPException(status_code=407, detail="Proxy Authentication Required.")
+        if "407" in error_msg or "Tunnel connection failed" in error_msg:
+            raise HTTPException(status_code=407, detail="Proxy Authentication Required (407).")
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
