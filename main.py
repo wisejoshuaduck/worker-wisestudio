@@ -10,12 +10,11 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="1.8.0"
+    version="1.9.0"
 )
 
-# Vous pouvez vider DEFAULT_PROXY si vous souhaitez tester sans proxy : ""
-DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
-PROXY_URL = os.getenv("PROXY_URL", DEFAULT_PROXY).strip()
+# Proxy désactivé pour éviter les erreurs 407
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 COOKIES_FILE_PATH = os.getenv("COOKIES_FILE_PATH", "cookies.txt")
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 
@@ -28,7 +27,6 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
-        "prefer_insecure": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "mweb"],
@@ -52,7 +50,7 @@ def get_base_ytdlp_opts() -> dict:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "YouTube Extractor Service"}
+    return {"status": "online", "message": "YouTube Extractor Service est opérationnel."}
 
 
 @app.post("/tasks/youtube")
@@ -98,11 +96,6 @@ async def create_youtube_task(request: Request):
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
         logger.error(f"Erreur d'extraction POST /tasks/youtube : {error_msg}")
-        if "407" in error_msg or "Tunnel connection failed" in error_msg:
-            raise HTTPException(
-                status_code=407, 
-                detail="Erreur Proxy (407). L'authentification a échoué ou l'adresse IP du serveur Render n'est pas autorisée par votre fournisseur de proxy."
-            )
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
 
 
@@ -122,6 +115,4 @@ def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
             }
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        if "407" in error_msg or "Tunnel connection failed" in error_msg:
-            raise HTTPException(status_code=407, detail="Proxy Authentication Required (407).")
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
