@@ -1,91 +1,45 @@
-"""
-Worker WiseStudio — FastAPI + yt-dlp.
-Deux usages, un seul endpoint /tasks/youtube avec un champ "mode" :
-  - mode="audio"  : extrait l'audio (pour la pipeline shorts/podcast de
-    WiseStudio), le découpe en tronçons de 10 minutes, et envoie tous
-    les tronçons en un seul callback multipart vers WiseStudio.
-  - mode="mp4"    : télécharge la vidéo complète (vidéo+audio fusionnés en
-    MP4) et l'envoie en callback à WiseStudio.
-Sécurité & Robustesse :
-  - Clé partagée comparée en temps constant (hmac.compare_digest).
-  - Vérification asynchrone de la durée avant téléchargement.
-  - Endpoint /ping pour empêcher la mise en veille de Render.
-  - Streaming d'upload pour éviter le dépassement de mémoire RAM.
-"""
-import asyncio
-import hmac
 import os
-import shutil
-import tempfile
-import subprocess
-from pathlib import Path
-from typing import Generator
-
-import httpx
-import yt_dlp
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+import logging
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import yt_dlp
+import httpx
 
-API_SECRET = os.getenv("WORKER_SECRET_KEY", "")
-MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))  # 1h
-CHUNK_SECONDS = 600  # 10 min
+# Configuration des logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("yt-extractor")
 
-# Variables pour le contournement des blocages de géolocalisation / datacenter
-PROXY_URL = os.getenv("PROXY_URL", "")
+app = FastAPI(
+    title="YouTube Video Extractor API",
+    description="API de récupération et de streaming direct de flux YouTube via yt-dlp",
+    version="1.1.0"
+)
+
+# Variables d'environnement
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+COOKIES_FILE_PATH = os.getenv("COOKIES_FILE_PATH", "cookies.txt")
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
-COOKIES_FILE_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
-
-app = FastAPI(title="WiseStudio Video Worker")
-
-
-class YoutubeTaskRequest(BaseModel):
-    youtube_url: str
-    project_id: int
-    callback_url: str
-    mode: str = "audio"  # "audio" ou "mp4"
-
-
-def check_key(x_worker_key: str | None) -> None:
-    if not API_SECRET or not x_worker_key or not hmac.compare_digest(x_worker_key, API_SECRET):
-        raise HTTPException(status_code=403, detail="Accès non autorisé")
 
 
 def get_base_ytdlp_opts() -> dict:
-    """Options yt-dlp robustes pour YouTube fin 2026 (clients + anti-blocage)."""
+    """Génère les options de base yt-dlp optimisées avec gestion d'authentification proxy."""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "no_cache_dir": True,          # ← corrigé (anciennement "nocache-dir")
+        "nocache_dir": True,
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
-        "retries": 10,
-        "fragment_retries": 10,
-        "file_access_retries": 5,
-        "retry_sleep_functions": {"http": lambda n: min(4 ** n, 30)},
         "extractor_args": {
             "youtube": {
-                # Clients les plus fiables actuellement (ordre important)
-                "player_client": [
-                    "android_vr",
-                    "ios",
-                    "mweb",
-                    "tv",
-                    "web_embedded",
-                    "android",
-                ],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["android", "ios", "mweb"],
+                "player_skip": ["webpage", "configs"]
             }
         },
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
-                "Mobile/15E148 Safari/604.1"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        # Utile sur les IPs datacenter
-        "socket_timeout": 30,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        }
     }
 
     if PROXY_URL:
@@ -97,223 +51,65 @@ def get_base_ytdlp_opts() -> dict:
     return opts
 
 
-def probe_duration(youtube_url: str) -> tuple[float, str]:
-    """Récupère durée + titre SANS télécharger."""
+class VideoInfo(BaseModel):
+    id: str
+    title: str
+    duration: Optional[int]
+    thumbnail: Optional[str]
+    uploader: Optional[str]
+    url: Optional[str]
+
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "YouTube Extractor Service est opérationnel."}
+
+
+@app.get("/info", response_model=VideoInfo)
+def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
+    """Extrait les métadonnées d'une vidéo YouTube."""
     opts = get_base_ytdlp_opts()
-    opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
-        return float(info.get("duration") or 0), str(info.get("title") or "Vidéo YouTube")
-
-
-def notify_error(callback_url: str, project_id: int, message: str) -> None:
+    
     try:
-        timeout = httpx.Timeout(10.0, read=30.0)
-        with httpx.Client(timeout=timeout) as client:
-            client.post(
-                callback_url,
-                json={"project_id": project_id, "error": message},
-                headers={"X-Worker-Key": API_SECRET},
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return VideoInfo(
+                id=info.get("id", ""),
+                title=info.get("title", ""),
+                duration=info.get("duration"),
+                thumbnail=info.get("thumbnail"),
+                uploader=info.get("uploader"),
+                url=info.get("url")
             )
-    except Exception:
-        pass
-
-
-def stream_file(file_path: str, chunk_size: int = 65536) -> Generator[bytes, None, None]:
-    """Générateur pour streaming d'upload sans charger tout en RAM."""
-    with open(file_path, "rb") as f:
-        while chunk := f.read(chunk_size):
-            yield chunk
-
-
-def process_audio(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
-    temp_dir = tempfile.mkdtemp()
-    open_files = []
-    try:
-        ydl_opts = get_base_ytdlp_opts()
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "outtmpl": os.path.join(temp_dir, "source.%(ext)s"),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }],
-        })
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(youtube_url, download=True)
-
-        # Cherche le fichier source (parfois l'extension varie)
-        source_audio = None
-        for name in ("source.mp3", "source.m4a", "source.webm", "source.opus"):
-            candidate = os.path.join(temp_dir, name)
-            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                source_audio = candidate
-                break
-
-        if not source_audio:
-            # Dernier recours : n'importe quel fichier audio
-            for f in os.listdir(temp_dir):
-                if f.startswith("source.") and os.path.getsize(os.path.join(temp_dir, f)) > 0:
-                    source_audio = os.path.join(temp_dir, f)
-                    break
-
-        if not source_audio:
-            raise RuntimeError("Extraction audio échouée (fichier source introuvable).")
-
-        # Découpage en tronçons de 10 min
-        chunk_starts = list(range(0, max(int(duration), 1), CHUNK_SECONDS)) or [0]
-        chunk_paths: list[Path] = []
-
-        for i, start in enumerate(chunk_starts):
-            chunk_path = Path(temp_dir) / f"chunk_{i}.mp3"
-            cmd = [
-                "ffmpeg", "-y", "-i", source_audio,
-                "-ss", str(start), "-t", str(CHUNK_SECONDS),
-                "-c", "copy", str(chunk_path),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                # Si -c copy échoue (codecs incompatibles), on réencode
-                cmd = [
-                    "ffmpeg", "-y", "-i", source_audio,
-                    "-ss", str(start), "-t", str(CHUNK_SECONDS),
-                    "-c:a", "libmp3lame", "-b:a", "128k",
-                    str(chunk_path),
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise RuntimeError(f"ffmpeg chunk {i} failed: {result.stderr[-500:]}")
-
-            if chunk_path.is_file() and chunk_path.stat().st_size > 0:
-                chunk_paths.append(chunk_path)
-
-        if not chunk_paths:
-            raise RuntimeError("Découpage audio échoué : aucun tronçon produit.")
-
-        files = []
-        for i, p in enumerate(chunk_paths):
-            fh = open(p, "rb")
-            open_files.append(fh)
-            files.append(("chunks", (f"chunk_{i}.mp3", fh, "audio/mpeg")))
-
-        data = {
-            "project_id": project_id,
-            "duration_seconds": duration,
-            "title": title,
-            "mode": "audio",
-            "chunk_starts": ",".join(str(s) for s in chunk_starts[:len(chunk_paths)]),
-        }
-        headers = {"X-Worker-Key": API_SECRET}
-        timeout = httpx.Timeout(10.0, read=300.0, write=300.0)
-
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(callback_url, data=data, files=files, headers=headers)
-            resp.raise_for_status()
-
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        if "407" in error_msg:
+            logger.error("Erreur 407: Authentification Proxy requise. Vérifiez vos identifiants PROXY_URL.")
+            raise HTTPException(status_code=407, detail="Proxy Authentication Required. Mot de passe ou format proxy incorrect.")
+        logger.error(f"Erreur d'extraction yt-dlp : {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Erreur lors de l'extraction : {error_msg}")
     except Exception as e:
-        notify_error(callback_url, project_id, f"Audio processing failed: {str(e)}")
-    finally:
-        for fh in open_files:
-            try:
-                fh.close()
-            except Exception:
-                pass
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.error(f"Erreur serveur inattendue : {str(e)}")
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
 
 
-def process_mp4(youtube_url: str, project_id: int, callback_url: str, duration: float, title: str) -> None:
-    temp_dir = tempfile.mkdtemp()
-    try:
-        ydl_opts = get_base_ytdlp_opts()
-        ydl_opts.update({
-            # Préfère H.264 + AAC (meilleure compatibilité)
-            "format": (
-                "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "best[ext=mp4]/best"
-            ),
-            "outtmpl": os.path.join(temp_dir, "video.%(ext)s"),
-            "merge_output_format": "mp4",
-        })
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(youtube_url, download=True)
-
-        video_path = os.path.join(temp_dir, "video.mp4")
-        if not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
-            candidates = [
-                f for f in os.listdir(temp_dir)
-                if f.endswith((".mp4", ".mkv", ".webm")) and os.path.getsize(os.path.join(temp_dir, f)) > 0
-            ]
-            if not candidates:
-                raise RuntimeError("Téléchargement MP4 échoué (fichier introuvable).")
-            video_path = os.path.join(temp_dir, candidates[0])
-
-        data = {
-            "project_id": project_id,
-            "duration_seconds": duration,
-            "title": title,
-            "mode": "mp4",
-        }
-        headers = {"X-Worker-Key": API_SECRET}
-        timeout = httpx.Timeout(10.0, read=600.0, write=600.0)
-
-        with httpx.Client(timeout=timeout) as client:
-            files = {"video": ("video.mp4", stream_file(video_path), "video/mp4")}
-            resp = client.post(callback_url, data=data, files=files, headers=headers)
-            resp.raise_for_status()
-
-    except Exception as e:
-        notify_error(callback_url, project_id, f"MP4 processing failed: {str(e)}")
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-@app.post("/tasks/youtube")
-async def handle_youtube(
-    task: YoutubeTaskRequest,
-    background_tasks: BackgroundTasks,
-    x_worker_key: str | None = Header(None),
-):
-    check_key(x_worker_key)
-
-    if task.mode not in ("audio", "mp4"):
-        raise HTTPException(status_code=400, detail="mode invalide (attendu: audio | mp4)")
+@app.get("/stream")
+async def stream_video(url: str = Query(..., description="URL de la vidéo YouTube")):
+    """Redirige ou streame le flux média directement."""
+    opts = get_base_ytdlp_opts()
+    opts["format"] = "best[ext=mp4]/best"
 
     try:
-        duration, title = await asyncio.to_thread(probe_duration, task.youtube_url)
-    except Exception as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Impossible de lire les métadonnées : {e}"
-        )
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get("url")
 
-    if duration <= 0:
-        raise HTTPException(status_code=422, detail="Durée de la vidéo introuvable.")
+            if not stream_url:
+                raise HTTPException(status_code=404, detail="Impossible de trouver un flux direct valide.")
 
-    if duration > MAX_DURATION_SECONDS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Vidéo trop longue ({int(duration // 60)} min). Limite : {MAX_DURATION_SECONDS // 60} min.",
-        )
+            return {"stream_url": stream_url, "title": info.get("title")}
 
-    target = process_audio if task.mode == "audio" else process_mp4
-    background_tasks.add_task(
-        target, task.youtube_url, task.project_id, task.callback_url, duration, title
-    )
-
-    return {
-        "status": "queued",
-        "project_id": task.project_id,
-        "duration_seconds": duration,
-        "title": title,
-    }
-
-
-@app.get("/ping")
-@app.get("/health")
-async def ping():
-    """Endpoint ultra-léger pour les vérifications de disponibilité et l'anti-mise en veille."""
-    return {"status": "alive", "ok": True}
+    except yt_dlp.utils.DownloadError as e:
+        if "407" in str(e):
+            raise HTTPException(status_code=407, detail="Échec du proxy (407 Proxy Authentication Required).")
+        raise HTTPException(status_code=400, detail=str(e))
