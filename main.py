@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Form
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 import yt_dlp
 
@@ -10,7 +10,7 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="1.6.0"
+    version="1.7.0"
 )
 
 DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
@@ -64,17 +64,31 @@ def read_root():
 
 
 @app.post("/tasks/youtube")
-async def create_youtube_task(
-    url: Optional[str] = Form(None),
-    link: Optional[str] = Form(None),
-    youtube_url: Optional[str] = Form(None),
-    video_url: Optional[str] = Form(None)
-):
-    """Accepte les formulaires multipart et les champs de type url, link ou youtube_url."""
-    target_url = url or link or youtube_url or video_url
+async def create_youtube_task(request: Request):
+    """Accepte indifféremment du JSON, des Form-data ou des Query params pour l'URL."""
+    target_url = None
     
+    # 1. Essayer de récupérer depuis les paramètres d'URL (Query params)
+    target_url = request.query_params.get("url") or request.query_params.get("youtube_url") or request.query_params.get("link")
+    
+    # 2. Essayer de récupérer depuis le corps (JSON ou Form-data)
     if not target_url:
-        raise HTTPException(status_code=422, detail="L'URL de la vidéo est manquante (champ url, link ou youtube_url requis).")
+        try:
+            content_type = request.headers.get("content-type", "")
+            if "application/json" in content_type:
+                body = await request.json()
+                target_url = body.get("url") or body.get("youtube_url") or body.get("link") or body.get("video_url")
+            elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+                form = await request.form()
+                target_url = form.get("url") or form.get("youtube_url") or form.get("link") or form.get("video_url")
+        except Exception:
+            pass
+
+    if not target_url:
+        raise HTTPException(
+            status_code=422, 
+            detail="L'URL de la vidéo est introuvable. Assurez-vous d'envoyer 'url', 'youtube_url' ou 'link'."
+        )
 
     opts = get_base_ytdlp_opts()
     opts["format"] = "best[ext=mp4]/best"
