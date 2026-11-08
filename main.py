@@ -1,8 +1,9 @@
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, root_validator
 import yt_dlp
 
 # Configuration des logs
@@ -12,7 +13,7 @@ logger = logging.getLogger("yt-extractor")
 app = FastAPI(
     title="YouTube Video Extractor API",
     description="API de récupération et de streaming direct de flux YouTube via yt-dlp",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # Variables d'environnement
@@ -52,9 +53,24 @@ def get_base_ytdlp_opts() -> dict:
     return opts
 
 
-# Schémas de requêtes et réponses
+# Modèle de requête avec gestion des déclinaisons de clés (url, link, video_url, etc.)
 class YouTubeTaskRequest(BaseModel):
-    url: str
+    url: Optional[str] = None
+    link: Optional[str] = None
+    youtube_url: Optional[str] = None
+    video_url: Optional[str] = None
+
+    @root_validator(pre=True)
+    def extract_any_url(cls, values):
+        """Récupère l'URL peu importe le nom du champ envoyé par le client."""
+        if not values:
+            return values
+        target_url = values.get("url") or values.get("link") or values.get("youtube_url") or values.get("video_url")
+        if not target_url:
+            raise ValueError("Aucune URL fournie. Utilisez la clé 'url', 'link' ou 'video_url'.")
+        values["url"] = target_url
+        return values
+
 
 class VideoInfo(BaseModel):
     id: str
@@ -65,22 +81,25 @@ class VideoInfo(BaseModel):
     url: Optional[str]
 
 
-# Remplacer l'ancienne route racine par celle-ci :
+# Gestionnaire de route générique pour GET et HEAD sur la racine (évite les 405 Method Not Allowed)
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "online", "message": "YouTube Extractor Service est opérationnel."}
 
 
-# Nouvel endpoint pour corriger les erreurs 404
 @app.post("/tasks/youtube")
-def create_youtube_task(payload: YouTubeTaskRequest):
-    """Reçoit un payload JSON {"url": "..."} et extrait les informations de la vidéo."""
+async def create_youtube_task(payload: YouTubeTaskRequest):
+    """Reçoit un payload JSON et extrait les informations de la vidéo."""
+    video_target_url = payload.url
+    if not video_target_url:
+        raise HTTPException(status_code=422, detail="L'URL de la vidéo est manquante dans le corps JSON.")
+
     opts = get_base_ytdlp_opts()
     opts["format"] = "best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(payload.url, download=False)
+            info = ydl.extract_info(video_target_url, download=False)
             return {
                 "status": "success",
                 "id": info.get("id", ""),
