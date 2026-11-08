@@ -1,11 +1,9 @@
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import yt_dlp
-import httpx
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO)
@@ -14,23 +12,25 @@ logger = logging.getLogger("yt-extractor")
 app = FastAPI(
     title="YouTube Video Extractor API",
     description="API de récupération et de streaming direct de flux YouTube via yt-dlp",
-    version="1.1.0"
+    version="1.2.0"
 )
 
-# Variables d'environnement
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+# Variable d'environnement avec votre proxy d'authentification par défaut
+DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
+PROXY_URL = os.getenv("PROXY_URL", DEFAULT_PROXY).strip()
 COOKIES_FILE_PATH = os.getenv("COOKIES_FILE_PATH", "cookies.txt")
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 
 
 def get_base_ytdlp_opts() -> dict:
-    """Génère les options de base yt-dlp optimisées avec gestion d'authentification proxy."""
+    """Génère les options de base yt-dlp optimisées pour contourner les blocages réseau et proxy."""
     opts = {
         "quiet": True,
         "no_warnings": True,
         "nocache_dir": True,
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
+        "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "mweb"],
@@ -38,7 +38,8 @@ def get_base_ytdlp_opts() -> dict:
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9"
         }
     }
 
@@ -84,8 +85,11 @@ def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
         if "407" in error_msg:
-            logger.error("Erreur 407: Authentification Proxy requise. Vérifiez vos identifiants PROXY_URL.")
-            raise HTTPException(status_code=407, detail="Proxy Authentication Required. Mot de passe ou format proxy incorrect.")
+            logger.error("Erreur 407 Proxy: L'IP de Render ou les identifiants ont été rejetés par le fournisseur du proxy.")
+            raise HTTPException(
+                status_code=407, 
+                detail="Erreur d'authentification Proxy (407). Vérifiez si l'IP de votre serveur doit être autorisée (IP Whitelist)."
+            )
         logger.error(f"Erreur d'extraction yt-dlp : {error_msg}")
         raise HTTPException(status_code=400, detail=f"Erreur lors de l'extraction : {error_msg}")
     except Exception as e:
@@ -95,7 +99,7 @@ def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
 
 @app.get("/stream")
 async def stream_video(url: str = Query(..., description="URL de la vidéo YouTube")):
-    """Redirige ou streame le flux média directement."""
+    """Extrait l'URL directe du flux vidéo."""
     opts = get_base_ytdlp_opts()
     opts["format"] = "best[ext=mp4]/best"
 
