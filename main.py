@@ -83,11 +83,19 @@ async def create_youtube_task(request: Request):
             detail="L'URL de la vidéo est introuvable. Assurez-vous d'envoyer 'url', 'youtube_url' ou 'link'."
         )
 
+    # Options spécifiques pour forcer un format direct sans erreur de disponibilité
     opts = get_base_ytdlp_opts()
+    opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
+            
+            # Si c'est un format combiné ou séparé, on récupère l'URL directe
+            stream_url = info.get("url")
+            if not stream_url and "requested_formats" in info:
+                stream_url = info["requested_formats"][0].get("url")
+
             return {
                 "status": "success",
                 "id": info.get("id", ""),
@@ -95,7 +103,7 @@ async def create_youtube_task(request: Request):
                 "duration": info.get("duration"),
                 "thumbnail": info.get("thumbnail"),
                 "uploader": info.get("uploader"),
-                "stream_url": info.get("url")
+                "stream_url": stream_url or info.get("webpage_url")
             }
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
