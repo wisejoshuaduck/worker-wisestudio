@@ -1,8 +1,8 @@
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, root_validator
+from fastapi import FastAPI, HTTPException, Query, Form
+from pydantic import BaseModel
 import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
@@ -10,7 +10,7 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="1.5.0"
+    version="1.6.0"
 )
 
 DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
@@ -49,19 +49,13 @@ def get_base_ytdlp_opts() -> dict:
     return opts
 
 
-class YouTubeTaskRequest(BaseModel):
-    url: Optional[str] = None
-    link: Optional[str] = None
-
-    @root_validator(pre=True)
-    def extract_any_url(cls, values):
-        if not values:
-            return values
-        target_url = values.get("url") or values.get("link")
-        if not target_url:
-            raise ValueError("Aucune URL fournie.")
-        values["url"] = target_url
-        return values
+class VideoInfo(BaseModel):
+    id: str
+    title: str
+    duration: Optional[int]
+    thumbnail: Optional[str]
+    uploader: Optional[str]
+    url: Optional[str]
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -70,13 +64,24 @@ def read_root():
 
 
 @app.post("/tasks/youtube")
-async def create_youtube_task(payload: YouTubeTaskRequest):
+async def create_youtube_task(
+    url: Optional[str] = Form(None),
+    link: Optional[str] = Form(None),
+    youtube_url: Optional[str] = Form(None),
+    video_url: Optional[str] = Form(None)
+):
+    """Accepte les formulaires multipart et les champs de type url, link ou youtube_url."""
+    target_url = url or link or youtube_url or video_url
+    
+    if not target_url:
+        raise HTTPException(status_code=422, detail="L'URL de la vidéo est manquante (champ url, link ou youtube_url requis).")
+
     opts = get_base_ytdlp_opts()
     opts["format"] = "best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(payload.url, download=False)
+            info = ydl.extract_info(target_url, download=False)
             return {
                 "status": "success",
                 "id": info.get("id", ""),
@@ -94,4 +99,25 @@ async def create_youtube_task(payload: YouTubeTaskRequest):
                 status_code=407, 
                 detail="Erreur Proxy (407). Vérifiez si l'IP Render est autorisée sur le panneau de votre fournisseur de proxy."
             )
+        raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
+
+
+@app.get("/info", response_model=VideoInfo)
+def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
+    opts = get_base_ytdlp_opts()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return VideoInfo(
+                id=info.get("id", ""),
+                title=info.get("title", ""),
+                duration=info.get("duration"),
+                thumbnail=info.get("thumbnail"),
+                uploader=info.get("uploader"),
+                url=info.get("url")
+            )
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        if "407" in error_msg:
+            raise HTTPException(status_code=407, detail="Proxy Authentication Required.")
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
