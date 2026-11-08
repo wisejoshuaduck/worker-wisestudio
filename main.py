@@ -65,7 +65,8 @@ class VideoInfo(BaseModel):
     url: Optional[str]
 
 
-@app.get("/")
+# Remplacer l'ancienne route racine par celle-ci :
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "online", "message": "YouTube Extractor Service est opérationnel."}
 
