@@ -10,7 +10,7 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
@@ -31,11 +31,11 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
-        # Utilisation d'un format universel qui évite l'erreur "Requested format is not available"
-        "format": "best",
+        "format": "best/bestvideo+bestaudio",
+        # Contournement anti-bot et erreur 403 via les clients mobiles
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb"],
+                "player_client": ["android", "ios"],
                 "player_skip": ["webpage", "configs"]
             }
         },
@@ -83,18 +83,18 @@ async def create_youtube_task(request: Request):
             detail="L'URL de la vidéo est introuvable. Assurez-vous d'envoyer 'url', 'youtube_url' ou 'link'."
         )
 
-    # Options spécifiques pour forcer un format direct sans erreur de disponibilité
     opts = get_base_ytdlp_opts()
-    opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
             
-            # Si c'est un format combiné ou séparé, on récupère l'URL directe
+            # Gestion des playlists ou vidéos unitaires
             stream_url = info.get("url")
-            if not stream_url and "requested_formats" in info:
-                stream_url = info["requested_formats"][0].get("url")
+            if not stream_url and "entries" in info and len(info["entries"]) > 0:
+                # Si c'est une playlist, on prend le premier élément valide
+                first_entry = info["entries"][0]
+                stream_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
 
             return {
                 "status": "success",
