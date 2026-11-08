@@ -1,22 +1,18 @@
 import os
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, root_validator
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, root_validator
 import yt_dlp
 
-# Configuration des logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    description="API de récupération et de streaming direct de flux YouTube via yt-dlp",
-    version="1.4.0"
+    version="1.5.0"
 )
 
-# Variables d'environnement
 DEFAULT_PROXY = "http://uiyunatn:tssen2qyz12x@31.59.20.176:6754"
 PROXY_URL = os.getenv("PROXY_URL", DEFAULT_PROXY).strip()
 COOKIES_FILE_PATH = os.getenv("COOKIES_FILE_PATH", "cookies.txt")
@@ -24,7 +20,6 @@ GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 
 
 def get_base_ytdlp_opts() -> dict:
-    """Génère les options de base yt-dlp optimisées pour contourner les blocages réseau et proxy."""
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -32,6 +27,7 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
+        "prefer_insecure": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "mweb"],
@@ -53,53 +49,34 @@ def get_base_ytdlp_opts() -> dict:
     return opts
 
 
-# Modèle de requête avec gestion des déclinaisons de clés (url, link, video_url, etc.)
 class YouTubeTaskRequest(BaseModel):
     url: Optional[str] = None
     link: Optional[str] = None
-    youtube_url: Optional[str] = None
-    video_url: Optional[str] = None
 
     @root_validator(pre=True)
     def extract_any_url(cls, values):
-        """Récupère l'URL peu importe le nom du champ envoyé par le client."""
         if not values:
             return values
-        target_url = values.get("url") or values.get("link") or values.get("youtube_url") or values.get("video_url")
+        target_url = values.get("url") or values.get("link")
         if not target_url:
-            raise ValueError("Aucune URL fournie. Utilisez la clé 'url', 'link' ou 'video_url'.")
+            raise ValueError("Aucune URL fournie.")
         values["url"] = target_url
         return values
 
 
-class VideoInfo(BaseModel):
-    id: str
-    title: str
-    duration: Optional[int]
-    thumbnail: Optional[str]
-    uploader: Optional[str]
-    url: Optional[str]
-
-
-# Gestionnaire de route générique pour GET et HEAD sur la racine (évite les 405 Method Not Allowed)
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "YouTube Extractor Service est opérationnel."}
+    return {"status": "online", "message": "YouTube Extractor Service"}
 
 
 @app.post("/tasks/youtube")
 async def create_youtube_task(payload: YouTubeTaskRequest):
-    """Reçoit un payload JSON et extrait les informations de la vidéo."""
-    video_target_url = payload.url
-    if not video_target_url:
-        raise HTTPException(status_code=422, detail="L'URL de la vidéo est manquante dans le corps JSON.")
-
     opts = get_base_ytdlp_opts()
     opts["format"] = "best[ext=mp4]/best"
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(video_target_url, download=False)
+            info = ydl.extract_info(payload.url, download=False)
             return {
                 "status": "success",
                 "id": info.get("id", ""),
@@ -111,61 +88,10 @@ async def create_youtube_task(payload: YouTubeTaskRequest):
             }
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        if "407" in error_msg:
-            logger.error("Erreur 407 Proxy lors du traitement de la tâche.")
-            raise HTTPException(status_code=407, detail="Proxy Authentication Required.")
         logger.error(f"Erreur d'extraction POST /tasks/youtube : {error_msg}")
-        raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
-    except Exception as e:
-        logger.error(f"Erreur serveur inattendue : {str(e)}")
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
-
-
-@app.get("/info", response_model=VideoInfo)
-def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
-    """Extrait les métadonnées d'une vidéo YouTube (Méthode GET)."""
-    opts = get_base_ytdlp_opts()
-    
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return VideoInfo(
-                id=info.get("id", ""),
-                title=info.get("title", ""),
-                duration=info.get("duration"),
-                thumbnail=info.get("thumbnail"),
-                uploader=info.get("uploader"),
-                url=info.get("url")
-            )
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
         if "407" in error_msg:
-            logger.error("Erreur 407 Proxy: Mot de passe ou format d'authentification invalide.")
-            raise HTTPException(status_code=407, detail="Proxy Authentication Required.")
-        logger.error(f"Erreur d'extraction GET /info : {error_msg}")
-        raise HTTPException(status_code=400, detail=f"Erreur lors de l'extraction : {error_msg}")
-    except Exception as e:
-        logger.error(f"Erreur serveur inattendue : {str(e)}")
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
-
-
-@app.get("/stream")
-async def stream_video(url: str = Query(..., description="URL de la vidéo YouTube")):
-    """Extrait l'URL directe du flux vidéo (Méthode GET)."""
-    opts = get_base_ytdlp_opts()
-    opts["format"] = "best[ext=mp4]/best"
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            stream_url = info.get("url")
-
-            if not stream_url:
-                raise HTTPException(status_code=404, detail="Impossible de trouver un flux direct valide.")
-
-            return {"stream_url": stream_url, "title": info.get("title")}
-
-    except yt_dlp.utils.DownloadError as e:
-        if "407" in str(e):
-            raise HTTPException(status_code=407, detail="Échec du proxy (407 Proxy Authentication Required).")
-        raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(
+                status_code=407, 
+                detail="Erreur Proxy (407). Vérifiez si l'IP Render est autorisée sur le panneau de votre fournisseur de proxy."
+            )
+        raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
