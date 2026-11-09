@@ -32,15 +32,15 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
         "format": "best/bestvideo+bestaudio",
-        # Utilisation exclusive des clients mobiles pour contourner le blocage du lecteur web
+        # Ordre de repli des clients pour éviter l'échec du player response
         "extractor_args": {
             "youtube": {
-                "player_client": ["android"],
-                "player_skip": ["webpage", "configs", "js"]
+                "player_client": ["mweb", "android", "web"],
+                "player_skip": ["configs"]
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
             "Accept-Language": "en-US,en;q=0.9"
         }
     }
