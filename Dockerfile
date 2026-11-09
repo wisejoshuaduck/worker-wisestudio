@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.11.9-slim
 
 # Installation de FFmpeg natif (extraction audio + découpage en tronçons +
 # fusion vidéo/audio pour le mode mp4).
@@ -12,3 +12,5 @@ COPY . .
 
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+
