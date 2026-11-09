@@ -32,15 +32,15 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
         "format": "best/bestvideo+bestaudio",
-        # Contournement anti-bot et erreur 403 via les clients mobiles
+        # Utilisation exclusive des clients mobiles pour contourner le blocage du lecteur web
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios"],
-                "player_skip": ["webpage", "configs"]
+                "player_client": ["android"],
+                "player_skip": ["webpage", "configs", "js"]
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9"
         }
     }
