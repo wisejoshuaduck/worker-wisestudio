@@ -32,15 +32,15 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
         "format": "best/bestvideo+bestaudio",
-        # Ordre de repli des clients pour éviter l'échec du player response
+        # Configuration spécifique pour contourner l'interdiction 403 sur les playlists et vidéos
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb", "android", "web"],
+                "player_client": ["android", "ios", "web"],
                 "player_skip": ["configs"]
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9"
         }
     }
