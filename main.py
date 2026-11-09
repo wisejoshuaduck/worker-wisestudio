@@ -10,15 +10,16 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 COOKIES_FILE_PATH = "cookies.txt"
 GEO_BYPASS_COUNTRY = os.getenv("GEO_BYPASS_COUNTRY", "US")
 
+# Écriture dynamique des cookies depuis la variable d'environnement Render
 COOKIES_CONTENT = os.getenv("COOKIES_CONTENT", "").strip()
-if COOKIES_CONTENT and not os.path.exists(COOKIES_FILE_PATH):
+if COOKIES_CONTENT:
     with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as f:
         f.write(COOKIES_CONTENT)
 
@@ -32,10 +33,9 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
         "format": "best/bestvideo+bestaudio",
-        # Configuration spécifique pour contourner l'interdiction 403 sur les playlists et vidéos
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
+                "player_client": ["android", "ios", "mweb"],
                 "player_skip": ["configs"]
             }
         },
@@ -56,7 +56,7 @@ def get_base_ytdlp_opts() -> dict:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "YouTube Extractor Service opérationnel."}
+    return {"status": "online", "message": "YouTube Extractor Service opérationnel avec cookies."}
 
 
 @app.post("/tasks/youtube")
@@ -89,10 +89,8 @@ async def create_youtube_task(request: Request):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
             
-            # Gestion des playlists ou vidéos unitaires
             stream_url = info.get("url")
             if not stream_url and "entries" in info and len(info["entries"]) > 0:
-                # Si c'est une playlist, on prend le premier élément valide
                 first_entry = info["entries"][0]
                 stream_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
 
