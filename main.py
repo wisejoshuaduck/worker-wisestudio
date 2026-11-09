@@ -32,6 +32,7 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
+        # Utiliser un format universel pour éviter l'erreur de disponibilité
         "format": "best/bestvideo+bestaudio",
         "extractor_args": {
             "youtube": {
