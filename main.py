@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -10,8 +12,11 @@ logger = logging.getLogger("yt-extractor")
 
 app = FastAPI(
     title="YouTube Video Extractor API",
-    version="2.3.0"
+    version="2.4.0"
 )
+
+# Pool de threads pour éviter le blocage synchrone de l'API par yt-dlp
+executor = ThreadPoolExecutor(max_workers=3)
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 COOKIES_FILE_PATH = "cookies.txt"
@@ -32,11 +37,10 @@ def get_base_ytdlp_opts() -> dict:
         "geo_bypass": True,
         "geo_bypass_country": GEO_BYPASS_COUNTRY,
         "nocheckcertificate": True,
-        # Utiliser un format universel pour éviter l'erreur de disponibilité
         "format": "best/bestvideo+bestaudio",
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb"],
+                "player_client": ["mweb", "android", "ios"],
                 "player_skip": ["configs"]
             }
         },
@@ -57,15 +61,17 @@ def get_base_ytdlp_opts() -> dict:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "YouTube Extractor Service opérationnel avec cookies."}
+    return {"status": "online", "message": "YouTube Extractor Service opérationnel."}
 
 
 @app.post("/tasks/youtube")
 async def create_youtube_task(request: Request):
     target_url = None
     
+    # 1. Recherche dans les Query Parameters
     target_url = request.query_params.get("url") or request.query_params.get("youtube_url") or request.query_params.get("link")
     
+    # 2. Recherche dans le Corps de la requête (JSON, Form-data, URL-encoded)
     if not target_url:
         try:
             content_type = request.headers.get("content-type", "")
@@ -85,45 +91,55 @@ async def create_youtube_task(request: Request):
         )
 
     opts = get_base_ytdlp_opts()
-    
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(target_url, download=False)
-            
-            stream_url = info.get("url")
-            if not stream_url and "entries" in info and len(info["entries"]) > 0:
-                first_entry = info["entries"][0]
-                stream_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
 
-            return {
-                "status": "success",
-                "id": info.get("id", ""),
-                "title": info.get("title", ""),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
-                "uploader": info.get("uploader"),
-                "stream_url": stream_url or info.get("webpage_url")
-            }
-    except yt_dlp.utils.DownloadError as e:
+    def extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(target_url, download=False)
+
+    try:
+        # Exécution non bloquante dans un thread séparé
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(executor, extract)
+        
+        stream_url = info.get("url")
+        if not stream_url and "entries" in info and len(info["entries"]) > 0:
+            first_entry = info["entries"][0]
+            stream_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
+
+        return {
+            "status": "success",
+            "id": info.get("id", ""),
+            "title": info.get("title", ""),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader"),
+            "stream_url": stream_url or info.get("webpage_url")
+        }
+    except Exception as e:
         error_msg = str(e)
         logger.error(f"Erreur d'extraction POST /tasks/youtube : {error_msg}")
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
 
 
 @app.get("/info")
-def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
+async def extract_info(url: str = Query(..., description="URL de la vidéo YouTube")):
     opts = get_base_ytdlp_opts()
-    try:
+    
+    def extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                "id": info.get("id", ""),
-                "title": info.get("title", ""),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
-                "uploader": info.get("uploader"),
-                "url": info.get("url")
-            }
-    except yt_dlp.utils.DownloadError as e:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(executor, extract)
+        return {
+            "id": info.get("id", ""),
+            "title": info.get("title", ""),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader"),
+            "url": info.get("url")
+        }
+    except Exception as e:
         error_msg = str(e)
         raise HTTPException(status_code=400, detail=f"Erreur d'extraction : {error_msg}")
